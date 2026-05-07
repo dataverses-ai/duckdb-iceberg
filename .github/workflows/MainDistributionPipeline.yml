@@ -25,6 +25,11 @@ jobs:
   duckdb-stable-deploy:
     name: Deploy extension binaries
     needs: duckdb-stable-build
+    # NOTE: Disabled for forks. The official deploy pipeline pushes to DuckDB's S3
+    # bucket and requires repo secrets that only live in duckdb/duckdb-iceberg.
+    # Forks should use the `Release Extension` workflow (.github/workflows/Release.yml)
+    # which publishes binaries to GitHub Releases instead.
+    if: github.repository == 'duckdb/duckdb-iceberg'
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@v1.5-variegata
     secrets: inherit
     with:
