@@ -1,0 +1,89 @@
+#
+# Fork-friendly release workflow.
+# Builds the iceberg extension for multiple platforms and attaches the
+# resulting .duckdb_extension binaries to a GitHub Release.
+#
+# Trigger:
+#   1. Push a tag of the form `v*` (e.g. `v0.1.0`) to auto-build + release.
+#   2. Manually via the Actions tab (workflow_dispatch) with a custom tag name.
+#
+# Consumption (from DuckDB):
+#   INSTALL iceberg FROM 'https://github.com/<your-user>/duckdb-iceberg/releases/download/<tag>';
+#   LOAD iceberg;
+#
+name: Release Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0-custom'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  #
+  # 1. Reuse DuckDB's official extension distribution pipeline to build
+  #    cross-platform binaries. Produces artifacts named after each arch.
+  #
+  build:
+    name: Build extension (multi-platform)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      extension_name: iceberg
+      duckdb_version: v1.5.2
+      ci_tools_version: v1.5-variegata
+      exclude_archs: 'windows_amd64_mingw'
+      extra_toolchains: 'python3'
+
+  #
+  # 2. Gather all platform artifacts and attach them to a GitHub Release.
+  #    No external secrets / S3 buckets required.
+  #
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all built extensions
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package binaries
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          # Each artifact contains a built iceberg.duckdb_extension for a given arch.
+          # Flatten them into release-assets with arch-suffixed names.
+          find artifacts -name 'iceberg.duckdb_extension' -print0 | while IFS= read -r -d '' f; do
+            arch_dir="$(basename "$(dirname "$(dirname "$f")")")"
+            cp "$f" "release-assets/iceberg.${arch_dir}.duckdb_extension"
+          done
+          ls -la release-assets
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: iceberg ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: release-assets/*
