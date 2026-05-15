@@ -6,6 +6,7 @@
 #include "storage/irc_catalog.hpp"
 #include "api_utils.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/common/types/blob.hpp"
 
@@ -20,8 +21,30 @@ static const case_insensitive_map_t<LogicalType> &IcebergSecretOptions() {
 	    {"client_id", LogicalType::VARCHAR},        {"client_secret", LogicalType::VARCHAR},
 	    {"endpoint", LogicalType::VARCHAR},         {"token", LogicalType::VARCHAR},
 	    {"oauth2_scope", LogicalType::VARCHAR},     {"oauth2_server_uri", LogicalType::VARCHAR},
-	    {"oauth2_grant_type", LogicalType::VARCHAR}};
+	    {"oauth2_grant_type", LogicalType::VARCHAR},
+	    {"extra_http_headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)}};
 	return options;
+}
+
+//! Parse a MAP<VARCHAR,VARCHAR> Value (typically from EXTRA_HTTP_HEADERS) into a flat
+//! string→string map. Silently ignores null / non-MAP values so callers can pass through
+//! "missing" lookups directly.
+static void ParseExtraHttpHeadersValue(const Value &headers_value, unordered_map<string, string> &out_headers) {
+	if (headers_value.IsNull() || headers_value.type().id() != LogicalTypeId::MAP) {
+		return;
+	}
+	// MAP is internally a LIST<STRUCT(key, value)>
+	auto &map_entries = MapValue::GetChildren(headers_value);
+	for (const auto &entry : map_entries) {
+		if (entry.type().id() != LogicalTypeId::STRUCT) {
+			continue;
+		}
+		auto &struct_children = StructValue::GetChildren(entry);
+		if (struct_children.size() != 2) {
+			continue;
+		}
+		out_headers[struct_children[0].ToString()] = struct_children[1].ToString();
+	}
 }
 
 } // namespace
@@ -58,7 +81,8 @@ static string XWWWFormUrlEncode(const string &input) {
 } // namespace
 
 string OAuth2Authorization::GetToken(ClientContext &context, const string &grant_type, const string &uri,
-                                     const string &client_id, const string &client_secret, const string &scope) {
+                                     const string &client_id, const string &client_secret, const string &scope,
+                                     const unordered_map<string, string> &extra_http_headers) {
 	vector<string> parameters;
 	parameters.push_back(StringUtil::Format("%s=%s", XWWWFormUrlEncode("grant_type"), XWWWFormUrlEncode(grant_type)));
 	parameters.push_back(StringUtil::Format("%s=%s", XWWWFormUrlEncode("scope"), XWWWFormUrlEncode(scope)));
@@ -69,6 +93,10 @@ string OAuth2Authorization::GetToken(ClientContext &context, const string &grant
 	HTTPHeaders headers(*context.db);
 	headers.Insert("Authorization", StringUtil::Format("Basic %s", Blob::ToBase64(credentials_blob)));
 	headers.Insert("Content-Type", StringUtil::Format("application/%s", "x-www-form-urlencoded"));
+	// Add extra HTTP headers (e.g., Polaris-Realm) to the token request
+	for (auto &entry : extra_http_headers) {
+		headers.Insert(entry.first, entry.second);
+	}
 	string post_data = StringUtil::Format("%s", StringUtil::Join(parameters, "&"));
 	std::unique_ptr<yyjson_doc, YyjsonDocDeleter> doc;
 	try {
@@ -110,6 +138,18 @@ unique_ptr<OAuth2Authorization> OAuth2Authorization::FromAttachOptions(ClientCon
 	case_insensitive_map_t<Value> create_secret_options;
 	string secret;
 	Value token;
+
+	// Extract extra_http_headers BEFORE the main classification loop so it's not
+	// treated as a 'create_secret_option' (which is mutually exclusive with 'secret').
+	// This allows EXTRA_HTTP_HEADERS to be combined with a SECRET in attach options.
+	Value extra_http_headers_value;
+	auto extra_headers_it = input.options.find("extra_http_headers");
+	if (extra_headers_it != input.options.end()) {
+		extra_http_headers_value = std::move(extra_headers_it->second);
+		input.options.erase(extra_headers_it);
+	}
+	// Parse extra_http_headers from attach options into the auth handler
+	ParseExtraHttpHeadersValue(extra_http_headers_value, result->extra_http_headers);
 
 	static const unordered_set<string> recognized_create_secret_options {
 	    "oauth2_scope", "oauth2_server_uri", "oauth2_grant_type",     "token",
@@ -153,6 +193,8 @@ unique_ptr<OAuth2Authorization> OAuth2Authorization::FromAttachOptions(ClientCon
 			input.endpoint = endpoint_from_secret.ToString();
 		}
 		token = kv_iceberg_secret.TryGetValue("token");
+		// Parse extra_http_headers from secret if present (merges with attach options)
+		ParseExtraHttpHeadersValue(kv_iceberg_secret.TryGetValue("extra_http_headers"), result->extra_http_headers);
 	} else {
 		if (!secret.empty()) {
 			set<string> option_names;
@@ -162,6 +204,11 @@ unique_ptr<OAuth2Authorization> OAuth2Authorization::FromAttachOptions(ClientCon
 			throw InvalidConfigurationException(
 			    "Both 'secret' and the following oauth2 option(s) were given: %s. These are mutually exclusive",
 			    StringUtil::Join(option_names, ", "));
+		}
+		// Add extra_http_headers to create_secret_options so it's stored in the secret
+		// and included in the OAuth2 token request
+		if (!extra_http_headers_value.IsNull()) {
+			create_secret_options["extra_http_headers"] = extra_http_headers_value;
 		}
 		CreateSecretInput create_secret_input;
 		if (!input.endpoint.empty()) {
@@ -195,7 +242,14 @@ unique_ptr<BaseSecret> OAuth2Authorization::CreateCatalogSecretFunction(ClientCo
 		auto &param_name = named_param.first;
 		auto it = accepted_parameters.find(param_name);
 		if (it != accepted_parameters.end()) {
-			result->secret_map[param_name] = named_param.second.ToString();
+			// Special handling for extra_http_headers (MAP type) — store the Value
+			// directly so we can re-parse the structured map later when issuing the
+			// token request.
+			if (StringUtil::CIEquals(param_name, "extra_http_headers")) {
+				result->secret_map[param_name] = named_param.second;
+			} else {
+				result->secret_map[param_name] = named_param.second.ToString();
+			}
 		} else {
 			throw InvalidInputException("Unknown named parameter passed to CreateIRCSecretFunction: %s", param_name);
 		}
@@ -252,11 +306,18 @@ unique_ptr<BaseSecret> OAuth2Authorization::CreateCatalogSecretFunction(ClientCo
 		result->secret_map["oauth2_scope"] = "PRINCIPAL_ROLE:ALL";
 	}
 
+	// Extract extra_http_headers from secret options for the token request
+	unordered_map<string, string> token_request_headers;
+	auto extra_headers_it = result->secret_map.find("extra_http_headers");
+	if (extra_headers_it != result->secret_map.end()) {
+		ParseExtraHttpHeadersValue(extra_headers_it->second, token_request_headers);
+	}
+
 	// Make a request to the oauth2 server uri to get the (bearer) token
 	result->secret_map["token"] = OAuth2Authorization::GetToken(
 	    context, result->secret_map["oauth2_grant_type"].ToString(), server_uri,
 	    result->secret_map["client_id"].ToString(), result->secret_map["client_secret"].ToString(),
-	    result->secret_map["oauth2_scope"].ToString());
+	    result->secret_map["oauth2_scope"].ToString(), token_request_headers);
 	return std::move(result);
 }
 
@@ -265,6 +326,10 @@ unique_ptr<HTTPResponse> OAuth2Authorization::Request(RequestType request_type, 
                                                       const string &data) {
 	if (!token.empty()) {
 		headers.Insert("Authorization", StringUtil::Format("Bearer %s", token));
+	}
+	// Forward any extra HTTP headers (e.g., Polaris-Realm) on every authorized API call.
+	for (auto &entry : extra_http_headers) {
+		headers.Insert(entry.first, entry.second);
 	}
 	return APIUtils::Request(request_type, context, endpoint_builder, client, headers, data);
 }

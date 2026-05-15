@@ -14,23 +14,28 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.1
     with:
       extension_name: iceberg
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4.4
+      duckdb_version: v1.4.1
+      ci_tools_version: v1.4.1
       exclude_archs: 'windows_amd64_mingw'
       extra_toolchains: 'python3'
 
   duckdb-stable-deploy:
     name: Deploy extension binaries
     needs: duckdb-stable-build
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@v1.4.4
+    # NOTE: Disabled for forks. The official deploy pipeline pushes to DuckDB's S3
+    # bucket and requires repo secrets that only live in duckdb/duckdb-iceberg.
+    # Forks should use the `Release Extension` workflow (.github/workflows/Release.yml)
+    # which publishes binaries to GitHub Releases instead.
+    if: github.repository == 'duckdb/duckdb-iceberg'
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@v1.4.1
     secrets: inherit
     with:
       extension_name: iceberg
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4.4
+      duckdb_version: v1.4.1
+      ci_tools_version: v1.4.1
       exclude_archs: 'windows_amd64_mingw'
       deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}

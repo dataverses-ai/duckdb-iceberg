@@ -19,7 +19,8 @@ public:
 	                                 const IRCEndpointBuilder &endpoint_builder, HTTPHeaders &headers,
 	                                 const string &data = "") override;
 	static string GetToken(ClientContext &context, const string &grant_type, const string &uri, const string &client_id,
-	                       const string &client_secret, const string &scope);
+	                       const string &client_secret, const string &scope,
+	                       const unordered_map<string, string> &extra_http_headers = {});
 	static void SetCatalogSecretParameters(CreateSecretFunction &function);
 	static unique_ptr<BaseSecret> CreateCatalogSecretFunction(ClientContext &context, CreateSecretInput &input);
 
@@ -34,6 +35,9 @@ public:
 	string default_region;
 	//! The (bearer) token retrieved
 	string token;
+	//! Extra HTTP headers (e.g. Polaris-Realm) to send with both the OAuth2 token request
+	//! and subsequent authorized API requests.
+	unordered_map<string, string> extra_http_headers;
 };
 
 } // namespace duckdb
