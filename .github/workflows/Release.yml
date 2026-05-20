@@ -4,11 +4,13 @@
 # resulting .duckdb_extension binaries to a GitHub Release.
 #
 # Trigger:
-#   1. Push a tag of the form `v*` (e.g. `v0.1.0`) to auto-build + release.
+#   1. Push a tag of the form `v*` (e.g. `v0.2.0`) to auto-build + release.
 #   2. Manually via the Actions tab (workflow_dispatch) with a custom tag name.
 #
 # Consumption (from DuckDB):
-#   INSTALL iceberg FROM 'https://github.com/<your-user>/duckdb-iceberg/releases/download/<tag>';
+#   SET custom_extension_repository = 'https://github.com/<your-user>/duckdb-iceberg/releases/download/<tag>';
+#   SET allow_unsigned_extensions = true;
+#   INSTALL iceberg;
 #   LOAD iceberg;
 #
 name: Release Extension
